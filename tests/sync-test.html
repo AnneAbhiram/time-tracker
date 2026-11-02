@@ -1,0 +1,234 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Sync tests</title>
+<body style="font:14px system-ui;padding:16px">
+<h1>Sync tests</h1>
+<p>Checks the GitHub client and the sync/merge logic against a pretend GitHub. Open this file in a browser; nothing touches your real data.</p>
+<ul id="out"></ul>
+<script src="../js/util.js"></script>
+<script src="../js/github.js"></script>
+<script src="../js/store.js"></script>
+<script>
+// A stand-in for localStorage.
+class MemoryStorage {
+  constructor() { this.m = new Map(); }
+  get length() { return this.m.size; }
+  key(i) { const k = [...this.m.keys()][i]; return k === undefined ? null : k; }
+  getItem(k) { return this.m.has(k) ? this.m.get(k) : null; }
+  setItem(k, v) { this.m.set(k, String(v)); }
+  removeItem(k) { this.m.delete(k); }
+}
+
+// A pretend GitHub repo shared by several "devices". Same rules as the real one:
+// a write with an out-of-date sha is refused.
+function makeRemote() {
+  const files = new Map();
+  const writes = [];
+  let n = 0;
+  return {
+    files, writes,
+    client(opts = {}) {
+      const c = { online: true, token: true };
+      const lag = () => new Promise(r => setTimeout(r, opts.latency || 0));
+      const guard = async () => {
+        await lag();
+        if (!c.online) { const e = new Error('No connection to GitHub'); e.network = true; throw e; }
+      };
+      c.hasToken = () => c.token;
+      c.read = async p => { await guard(); const f = files.get(p); return f ? { sha: f.sha, text: f.text } : null; };
+      c.write = async (p, text, sha) => {
+        await guard();
+        const f = files.get(p);
+        if ((f && f.sha !== sha) || (!f && sha)) { const e = new Error('conflict'); e.status = f && !sha ? 422 : 409; throw e; }
+        const next = { sha: 'sha' + (++n), text };
+        files.set(p, next);
+        writes.push(p);
+        return next.sha;
+      };
+      c.list = async dir => { await guard(); return [...files.keys()].filter(k => k.startsWith(dir + '/')).map(k => k.slice(dir.length + 1)); };
+      return c;
+    }
+  };
+}
+
+const device = (remote, opts) => {
+  const gh = remote.client(opts);
+  const storage = new MemoryStorage();
+  return { gh, storage, store: TT.makeStore(gh, storage, { debounce: 0 }) };
+};
+const ids = items => items.map(i => i.id).sort();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const eq = (got, want, what = '') => {
+  if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error(`${what} expected ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+};
+const HOURS = 'hours/2026-11.json';
+const remoteIds = (remote, p) => ids(JSON.parse(remote.files.get(p).text).items);
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+test('a new record reaches GitHub', async () => {
+  const remote = makeRemote();
+  const d = device(remote);
+  d.store.put(HOURS, { id: 'a', date: '2026-11-02', minutes: 30 });
+  await d.store.settle();
+  eq(remoteIds(remote, HOURS), ['a']);
+  eq(d.store.status, 'synced');
+});
+
+test('two devices adding at the same time keep both records', async () => {
+  const remote = makeRemote();
+  const a = device(remote), b = device(remote);
+  a.store.put(HOURS, { id: 'a1', date: '2026-11-02', minutes: 30 });
+  await a.store.settle();
+  b.store.put(HOURS, { id: 'b1', date: '2026-11-02', minutes: 30 });   // b has never seen a's file
+  await b.store.settle();
+  eq(remoteIds(remote, HOURS), ['a1', 'b1']);
+  await a.store.load(HOURS);
+  await a.store.refreshAll();
+  eq(ids(a.store.items(HOURS)), ['a1', 'b1']);
+});
+
+test('a delete on one device is not undone by another', async () => {
+  const remote = makeRemote();
+  const a = device(remote), b = device(remote);
+  a.store.put(HOURS, { id: 'x', date: '2026-11-02', minutes: 30 });
+  await a.store.settle();
+  await b.store.load(HOURS);
+  eq(ids(b.store.items(HOURS)), ['x']);
+  await sleep(3);
+  a.store.remove(HOURS, 'x');
+  await a.store.settle();
+  await b.store.refreshAll();
+  eq(ids(b.store.items(HOURS)), [], 'b after a deleted');
+  b.store.put(HOURS, { id: 'y', date: '2026-11-02', minutes: 30 });
+  await b.store.settle();
+  await a.store.refreshAll();
+  eq(ids(a.store.items(HOURS)), ['y'], 'a after b added');
+});
+
+test('the newer edit wins', async () => {
+  const remote = makeRemote();
+  const a = device(remote), b = device(remote);
+  a.store.put('log/2026-11.json', { id: 'e', title: 'old' });
+  await a.store.settle();
+  await b.store.load('log/2026-11.json');
+  await sleep(3);
+  b.store.put('log/2026-11.json', { id: 'e', title: 'new' });
+  await b.store.settle();
+  await a.store.refreshAll();
+  eq(a.store.items('log/2026-11.json')[0].title, 'new');
+});
+
+test('a tap made while a save is in flight is not lost', async () => {
+  const remote = makeRemote();
+  const d = device(remote, { latency: 30 });
+  d.store.put(HOURS, { id: 'p1', date: '2026-11-02', minutes: 30 });
+  await sleep(10);
+  d.store.put(HOURS, { id: 'p2', date: '2026-11-02', minutes: 30 });
+  await d.store.settle();
+  eq(remoteIds(remote, HOURS), ['p1', 'p2']);
+});
+
+test('changes made offline are kept and sent later', async () => {
+  const remote = makeRemote();
+  const d = device(remote);
+  d.gh.online = false;
+  d.store.put(HOURS, { id: 'off', date: '2026-11-02', minutes: 30 });
+  await d.store.settle();
+  eq(d.store.status, 'offline');
+  eq(remote.files.has(HOURS), false, 'nothing on GitHub yet');
+  d.gh.online = true;
+  d.store.flush();
+  await d.store.settle();
+  eq(remoteIds(remote, HOURS), ['off']);
+  eq(d.store.status, 'synced');
+});
+
+test('unsent changes survive closing and reopening the app', async () => {
+  const remote = makeRemote();
+  const d = device(remote);
+  d.gh.online = false;
+  d.store.put(HOURS, { id: 'kept', date: '2026-11-02', minutes: 30 });
+  await d.store.settle();
+  const reopened = TT.makeStore(d.gh, d.storage, { debounce: 0 });   // new page load, same browser storage
+  eq(ids(reopened.items(HOURS)), ['kept']);
+  d.gh.online = true;
+  reopened.flush();
+  await reopened.settle();
+  eq(remoteIds(remote, HOURS), ['kept']);
+});
+
+test('without a token everything stays on the device', async () => {
+  const remote = makeRemote();
+  const d = device(remote);
+  d.gh.token = false;
+  d.store.put('log/2026-11.json', { id: 'n', title: 'local only' });
+  await d.store.settle();
+  eq(d.store.status, 'noauth');
+  eq(remote.writes.length, 0, 'writes');
+  eq(ids(d.store.items('log/2026-11.json')), ['n']);
+  eq(await d.store.listDir('log'), ['2026-11.json']);
+});
+
+test('GitHub client sends the right request and handles accents', async () => {
+  const calls = [];
+  const reply = (status, body) => ({ status, ok: status < 400, statusText: 'x', json: async () => body });
+  let next = reply(200, { content: { sha: 's2' } });
+  const gh = TT.makeGithub(() => ({ owner: 'o', repo: 'r', token: 'tok' }), async (url, init) => { calls.push({ url, init }); return next; });
+  const text = '{"title":"Café ✓ 日本"}';
+  const sha = await gh.write('hours/2026-11.json', text, null, 'msg');
+  eq(sha, 's2');
+  const c = calls[0];
+  eq(c.url, 'https://api.github.com/repos/o/r/contents/hours/2026-11.json');
+  eq(c.init.method, 'PUT');
+  eq(c.init.headers.Authorization, 'Bearer tok');
+  eq(c.init.cache, 'no-store');
+  const body = JSON.parse(c.init.body);
+  eq('sha' in body, false, 'sha omitted for new file');
+  const bytes = Uint8Array.from(atob(body.content), ch => ch.charCodeAt(0));
+  eq(new TextDecoder().decode(bytes), text, 'round trip');
+
+  const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(text)));
+  next = reply(200, { sha: 's9', content: b64.slice(0, 8) + '\n' + b64.slice(8) });
+  const got = await gh.read('x.json');
+  eq(got, { sha: 's9', text });
+
+  next = reply(404, {});
+  eq(await gh.read('missing.json'), null);
+  eq(await gh.list('log'), []);
+  next = reply(409, { message: 'conflict' });
+  try { await gh.write('x.json', 'a', 'old', 'm'); throw new Error('should fail'); } catch (e) { eq(e.status, 409); }
+  next = reply(401, { message: 'Bad credentials' });
+  try { await gh.read('x.json'); throw new Error('should fail'); } catch (e) { eq(e.status, 401); }
+  const offline = TT.makeGithub(() => ({ owner: 'o', repo: 'r', token: 't' }), async () => { throw new TypeError('Failed to fetch'); });
+  try { await offline.read('x.json'); throw new Error('should fail'); } catch (e) { eq(!!e.network, true, 'network flag'); }
+});
+
+test('date helpers cross month and year ends', async () => {
+  eq(TT.addDays('2026-11-30', 1), '2026-12-01');
+  eq(TT.addDays('2026-03-01', -1), '2026-02-28');
+  eq(TT.addMonths('2026-12', 1), '2027-01');
+  eq(TT.addMonths('2026-01', -1), '2025-12');
+  eq(TT.daysIn('2026-02'), 28);
+  eq(TT.hrs(90), '1.5');
+});
+
+(async () => {
+  const out = document.getElementById('out');
+  let passed = 0;
+  for (const [name, fn] of tests) {
+    let li;
+    try { await fn(); passed++; li = `PASS  ${name}`; } catch (e) { li = `FAIL  ${name} :: ${e.message}`; }
+    const el = document.createElement('li');
+    el.textContent = li;
+    out.append(el);
+  }
+  const summary = `${passed}/${tests.length} passed`;
+  const p = document.createElement('p');
+  p.textContent = summary;
+  p.style.fontWeight = '700';
+  out.after(p);
+  document.title = summary;
+})();
+</script>

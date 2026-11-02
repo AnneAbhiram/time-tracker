@@ -1,0 +1,12 @@
+{
+  "name": "Time tracker",
+  "short_name": "Time",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#E9EEDB",
+  "theme_color": "#E9EEDB",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
